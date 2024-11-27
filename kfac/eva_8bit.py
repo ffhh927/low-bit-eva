@@ -83,47 +83,7 @@ class KFAC(optim.Optimizer):
 
         self.code = B_F.create_dynamic_map(signed=True).to(next(model.parameters()).device)  # 创建动态量化映射表
         self.optim = SGD8bit(model.parameters(), lr=lr, momentum=sgd_momentum)
-        # self.model = model
-        # self.a_buf = torch.empty(self.block_size, dtype=torch.float32, device=model.device)
-        # self.g_buf = torch.empty(self.block_size, dtype=torch.float32, device=model.device)
-        # self.a_buf_current_pos, self.g_buf_current_pos = 0, 0
-    
-    # def add_to_buffer(self, a, module):
-    #     """
-    #     向 buffer 填充数据，并在 buffer 满时提取已填充的 a。
-    #     """
-    #     a_len = a.shape[0]
-    #     start_idx = 0
-
-    #     while a_len > 0:
-    #         available_space = self.buffer_size - self.current_pos
-    #         if a_len <= available_space:
-    #             # 如果剩余空间足够，直接填充
-    #             self.buffer[self.current_pos:self.current_pos + a_len] = a[start_idx:]
-    #             self.shapes.append(a_len)  # 记录当前 `a` 的长度
-    #             self.current_pos += a_len
-    #             break
-    #         else:
-    #             # 如果空间不足，先填满 buffer 剩余部分
-    #             fill_length = available_space
-    #             self.buffer[self.current_pos:] = a[start_idx:start_idx + fill_length]
-    #             self.shapes.append(fill_length)  # 记录填充部分长度
-    #             self._flush_buffer()  # 将 buffer 数据存入 a_list
-    #             start_idx += fill_length
-    #             a_len -= fill_length
-                
-    # def _flush_buffer(self):
-    #     """
-    #     内部方法：提取 buffer 数据，按 shapes 切片恢复 a。
-    #     """
-    #     current_offset = 0
-    #     for length in self.shapes:
-    #         self.a_list.append(self.buffer[current_offset:current_offset + length].clone())
-    #         current_offset += length
-    #     self.buffer.zero_()  # 清空 buffer
-    #     self.current_pos = 0  # 重置写入位置
-    #     self.shapes.clear()  # 清空记录的形状  
-          
+         
     ### Register hooks
     def set_hook_enabled(self, mode=True):
         self.hook_enabled = mode
@@ -138,10 +98,8 @@ class KFAC(optim.Optimizer):
                     self.m_a[module] = (new_fp32[-1], new_fp8)
                 else:
                     m_a_old = B_F.dequantize_blockwise(self.m_a[module][1], self.quant_state_a[module], blocksize=self.block_size)
-                    # print(m_a_old)
                     new_fp32_0 = new_fp32[-1]
                     new_fp32 = new_fp32[:-1]
-                    # m_a_old = torch.cat((m_a_old, self.m_a[module][0].unsqueeze(0)), dim=0)
                     new_fp32 = m_a_old.mul_(1-self.factor_decay).add_(new_fp32, alpha=self.factor_decay)
                     new_fp32_0 = self.m_a[module][0].mul_(1-self.factor_decay).add_(new_fp32_0 , alpha=self.factor_decay)
                     # print(new_fp32)
@@ -158,21 +116,14 @@ class KFAC(optim.Optimizer):
                     new_fp8, self.quant_state_g[module] = B_F.quantize_blockwise(new_fp32[1:], code=self.code, blocksize=self.block_size)
                     self.m_g[module] = (new_fp32[0], new_fp8)
                 else:
-                    # print(self.quant_state_g[module].absmax)
-                    # for param in self.model.parameters():
-                    #     print(param)
                     m_g_old = B_F.dequantize_blockwise(self.m_g[module][1], self.quant_state_g[module], blocksize=self.block_size)
-                    # print(m_g_old)
-                    # m_g_old = torch.cat((self.m_g[module][0].unsqueeze(0), m_g_old), dim=0)
                     new_fp32_0 = new_fp32[0]
                     new_fp32 = new_fp32[1:]
-                    # print(new_fp32)
                     new_fp32 = m_g_old.mul_(1-self.factor_decay).add_(new_fp32, alpha=self.factor_decay)
                     new_fp32_0 = self.m_g[module][0].mul_(1-self.factor_decay).add_(new_fp32_0, alpha=self.factor_decay)
-                    # print(new_fp32)
                     new_fp8, self.quant_state_g[module] = B_F.quantize_blockwise(new_fp32, code=self.code, blocksize=self.block_size)
                     self.m_g[module] = (new_fp32_0, new_fp8)
-                    # print(new_fp8)
+
     # def _forward_hook_event(self, module, input):
     #     """Default: hook for saving input (a)"""
     #     if self.hook_enabled and torch.is_grad_enabled() and self.steps % self.fac_update_freq == 0:
@@ -228,20 +179,14 @@ class KFAC(optim.Optimizer):
         g_sum = 0
         v_sum = 0
         vg_sum = 0
-#         print(len(self.modules))
-        # for param in self.model.parameters():
-        #     print(param)
+
         for module in self.modules:
             # get ma, mg, grad
-            # print(self.m_g[module][1])
+
             ma = torch.cat((B_F.dequantize_blockwise(self.m_a[module][1], self.quant_state_a[module], blocksize=self.block_size), self.m_a[module][0].unsqueeze(0)), dim=0).view(-1, 1)
             mg = torch.cat((self.m_g[module][0].unsqueeze(0), B_F.dequantize_blockwise(self.m_g[module][1], self.quant_state_g[module], blocksize=self.block_size)), dim=0).view(-1, 1)
-            # logging.debug(f"Logging a :\n{ma}")
-            # logging.debug(f"Logging g :\n{mg}")
             # print(ma)
-            print(ma)
-            # print(self.quant_state_g[module].absmax)
-            print(mg)
+            # print(mg)
             grad = self._get_grad(module)
 #             print(grad.size())
             #if backend.comm.rank() == 0:

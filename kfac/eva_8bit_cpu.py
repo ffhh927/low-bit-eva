@@ -11,83 +11,9 @@ import torch.profiler as profiler
 from kfac.utils import get_vector_a, get_vector_g
 import logging
 logger = logging.getLogger()
-# 配置日志
-logging.basicConfig(
-    filename="./logs/eva8bit_cpu.log",       # 日志文件名
-    level=logging.INFO,        # 日志级别
-    format="%(levelname)s - %(message)s",  # 日志格式
-)
 from concurrent.futures import ThreadPoolExecutor, wait
 import time
-def batch_transfer_to_cpu_inplace(tensor_list):
-    """
-    将张量列表中的每个张量合并到缓冲区，一次性传输到 CPU，并原地修改列表内容。
-    
-    Args:
-        tensor_list (list of torch.Tensor): 输入张量列表，所有张量需位于相同设备。
-        
-    Returns:
-        None: 原地修改张量列表的内容。
-    """
-    # 检查张量是否位于同一设备
-    device = tensor_list[0].device
-    for tensor in tensor_list:
-        if tensor.device != device:
-            raise ValueError("All tensors in the list must be on the same device.")
-    
-    # 计算缓冲区大小和偏移量
-    offsets = [0]
-    total_size = 0
-    for tensor in tensor_list:
-        total_size += tensor.numel()
-        offsets.append(total_size)
-    
-    # 创建缓冲区并拷贝数据
-    buf = torch.empty(total_size, dtype=tensor_list[0].dtype, device=device)
-    for tensor, start, end in zip(tensor_list, offsets[:-1], offsets[1:]):
-        buf[start:end] = tensor.flatten()
-    
-    # 一次性传输到 CPU
-    buf_cpu = buf.to("cpu", non_blocking=True)
-    
-    # 从缓冲区还原张量并原地修改
-    for i, (tensor, start, end) in enumerate(zip(tensor_list, offsets[:-1], offsets[1:])):
-        tensor_list[i] = buf_cpu[start:end].view_as(tensor)
 
-def batch_transfer_to_gpu_inplace(tensor_list, device):
-    """
-    将张量列表中的每个张量合并到缓冲区，一次性传输到 GPU，并原地修改列表内容。
-    
-    Args:
-        tensor_list (list of torch.Tensor): 输入张量列表，所有张量需位于同一设备。
-        device (torch.device): 目标设备（如 'cuda:0' 或 'cuda'）。
-        
-    Returns:
-        None: 原地修改张量列表的内容。
-    """
-    # 检查张量是否位于同一设备
-    for tensor in tensor_list:
-        if tensor.device != 'cpu':  # 可以接收 CPU 张量
-            raise ValueError("All tensors in the list must be on CPU.")
-    
-    # 计算缓冲区大小和偏移量
-    offsets = [0]
-    total_size = 0
-    for tensor in tensor_list:
-        total_size += tensor.numel()
-        offsets.append(total_size)
-    
-    # 创建缓冲区并拷贝数据
-    buf = torch.empty(total_size, dtype=tensor_list[0].dtype, device='cpu')
-    for tensor, start, end in zip(tensor_list, offsets[:-1], offsets[1:]):
-        buf[start:end] = tensor.flatten()
-    
-    # 一次性传输到 GPU
-    buf_gpu = buf.to(device, non_blocking=True)
-    
-    # 从缓冲区还原张量并原地修改
-    for i, (tensor, start, end) in enumerate(zip(tensor_list, offsets[:-1], offsets[1:])):
-        tensor_list[i] = buf_gpu[start:end].view_as(tensor)
 class KFAC(optim.Optimizer):
     """Accelerate Distributed K-FAC with Sublinear Memory Cost
     Args:
@@ -176,19 +102,16 @@ class KFAC(optim.Optimizer):
                     new_fp8, self.quant_state_a[module] = B_F.quantize_blockwise(new_fp32[:-1], code=self.code, blocksize=self.block_size)
                     self.m_a[module] = [new_fp32[-1], new_fp8]
                 else:
-                    # print("start")
+                    # weights
                     # start = time.time()
                     self.tasks.append(self.cpu_executor.submit(
                         self._cpu_quantization_taskA, 
                         module, new_fp32[:-1]
                     ))
                     
-                    # self.m_a[module][0].mul_(1-self.factor_decay).add_(new_fp32[-1], alpha=self.factor_decay)
+                    # bias
                     torch.lerp(self.m_a[module][0], new_fp32[-1], self.factor_decay, out=self.m_a[module][0])
                     # print(time.time()-start)
-                # del new_fp32
-        # print(time.time()-start)     
-
                             
     def _backward_hook_event(self, module, grad_input, grad_output):
         """Default: hook for saving gradient w.r.t output (g)"""
@@ -200,66 +123,52 @@ class KFAC(optim.Optimizer):
                     new_fp8, self.quant_state_g[module] = B_F.quantize_blockwise(new_fp32[1:], code=self.code, blocksize=self.block_size)
                     self.m_g[module] = [new_fp32[0], new_fp8]
                 else:
-                    # print("test")
-                    # new_fp32_cpu = new_fp32[1:].cpu()
-                    # with profiler.profile(
-                    #     activities=[profiler.ProfilerActivity.CPU, profiler.ProfilerActivity.CUDA],
-                    #     on_trace_ready=profiler.tensorboard_trace_handler('./log')
-                    # ) as prof:
-                    #     self.tasks.append(self.cpu_executor.submit(
-                    #         self._cpu_quantization_taskG, 
-                    #         module, new_fp32[1:]
-                    #     ))
-                    # print(prof.key_averages().table(sort_by="cuda_time_total"))
-                    # self.m_g[module][0].mul_(1-self.factor_decay).add_(new_fp32[0], alpha=self.factor_decay)
-                    # for param in self.model.parameters():
-                    #     print(param)
+                    # weights
                     self.tasks.append(self.cpu_executor.submit(
                             self._cpu_quantization_taskG, 
                             module, new_fp32[1:]
                     ))
+                    # bias
                     torch.lerp(self.m_g[module][0], new_fp32[0], self.factor_decay, out=self.m_g[module][0])
-                del new_fp32
-    
     
     def _cpu_quantization_taskA(self, module, new_fp32):
-        # 解量化 -> 合并 -> 重新量化  
+        # gpu -> cpu
         self.quant_state_a[module].absmax = self.quant_state_a[module].absmax.cpu()
         new_fp32 = new_fp32.cpu()
+        
+        # dequantize
         m_a_old = B_F.dequantize_blockwise(self.m_a[module][1].cpu(), self.quant_state_a[module], blocksize=self.block_size)
-        # print(f"[{threading.current_thread().name}] m_g: {self.quant_state_g[module].absmax}")
-        # m_g_old = B_F.dequantize_blockwise(self.m_g[module][1], self.quant_state_g[module], blocksize=self.block_size)
-        # print(f"[{threading.current_thread().name}] a m_g_old: {m_g_old}")
-        # print(f"[{threading.current_thread().name}] g new_fp32: {new_fp32}")
+        
+        # compute
         torch.lerp(m_a_old, new_fp32, self.factor_decay, out=new_fp32)
-        # print(f"[{threading.current_thread().name}] g new_fp32: {new_fp32}")
+        
+        # quantize
         new_fp8, self.quant_state_a[module] = B_F.quantize_blockwise(new_fp32, code=self.code, blocksize=self.block_size)
-        # self.batch_transfer_to_gpu_inplace([self.quant_state_g[module].absmax, self.m_g[module][1]])
+        
+        # gpu -> cpu
         self.quant_state_a[module].absmax = self.quant_state_a[module].absmax.to(self.device, non_blocking=True)
         self.quant_state_a[module].code = self.code
         self.m_a[module][1] = new_fp8.to(self.device, non_blocking=True)
             
     def _cpu_quantization_taskG(self, module, new_fp32):
-            # 解量化 -> 合并 -> 重新量化
-        # batch_transfer_to_cpu_inplace([self.quant_state_g[module].absmax, new_fp32, self.m_g[module][1]])
-        # torch.cuda.synchronize()
-        # self.quant_state_g[module].absmax = restored_tensors
+        # gpu -> cpu
         self.quant_state_g[module].absmax = self.quant_state_g[module].absmax.cpu()
         new_fp32 = new_fp32.cpu()
+        
+        # dequantize
         m_g_old = B_F.dequantize_blockwise(self.m_g[module][1].cpu(), self.quant_state_g[module], blocksize=self.block_size)
-        # print(f"[{threading.current_thread().name}] m_g: {self.quant_state_g[module].absmax}")
-        # m_g_old = B_F.dequantize_blockwise(self.m_g[module][1], self.quant_state_g[module], blocksize=self.block_size)
-        # print(f"[{threading.current_thread().name}] a m_g_old: {m_g_old}")
-        # print(f"[{threading.current_thread().name}] g new_fp32: {new_fp32}")
+
+        # compute
         torch.lerp(m_g_old, new_fp32, self.factor_decay, out=new_fp32)
-        # print(f"[{threading.current_thread().name}] g new_fp32: {new_fp32}")
+
+        # quantize
         new_fp8, self.quant_state_g[module] = B_F.quantize_blockwise(new_fp32, code=self.code, blocksize=self.block_size)
-        # self.batch_transfer_to_gpu_inplace([self.quant_state_g[module].absmax, self.m_g[module][1]])
+
+        # gpu -> cpu
         self.quant_state_g[module].absmax = self.quant_state_g[module].absmax.to(self.device, non_blocking=True)
         self.quant_state_g[module].code = self.code
         self.m_g[module][1] = new_fp8.to(self.device, non_blocking=True)
-        # print(f"[{threading.current_thread().name}] g new_fp8: {new_fp8}")
-        # logging.info(f"Logging a :\n{new_fp8}")
+
     
     def _register_module_hooks(self, model):
         """Register forard/backward hooks to supported modules"""
@@ -289,20 +198,13 @@ class KFAC(optim.Optimizer):
         
         wait(self.tasks)
         self.tasks.clear()
-        # print("test")
-        # for param in self.model.parameters():
-        #     print(param)
+
         for module in self.modules:
-            # print("test")
-            # print(self.m_a[module][0])
-            # print(self.m_a[module][1])
             ma = torch.cat((B_F.dequantize_blockwise(self.m_a[module][1], self.quant_state_a[module], blocksize=self.block_size), self.m_a[module][0].unsqueeze(0)), dim=0).view(-1, 1)
             mg = torch.cat((self.m_g[module][0].unsqueeze(0), B_F.dequantize_blockwise(self.m_g[module][1], self.quant_state_g[module], blocksize=self.block_size)), dim=0).view(-1, 1)
-            # logging.info(f"Logging a :\n{ma}")
-            # logging.info(f"Logging g :\n{mg}")
-            print(ma)
-            # print(self.quant_state_g[module].absmax)
-            print(mg)
+
+            # print(ma)
+            # print(mg)
             grad = self._get_grad(module)
             
             # compute intermediate states

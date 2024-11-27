@@ -249,7 +249,7 @@ models = ['res20', 'autoencoder', 'vit']
 #     'shampoo4bit', 'shampoo4bit_svd'
 # ]
 optimizers = [
-    'eva8bit_cpu',
+    'eva8bit',
 ]
 
 # 使用嵌套循环来简化调用

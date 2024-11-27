@@ -62,7 +62,7 @@ class ResNet(nn.Module):
         
         self.fc = nn.Linear(64,10)
     
-    @profile
+    # @profile
     def forward(self, x):
         x = self.pool(F.relu(self.norm1(self.conv1(x))))
         
