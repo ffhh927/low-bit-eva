@@ -84,6 +84,10 @@ class KFAC(optim.Optimizer):
         self.tasks = []
         
         self.optim = SGD8bit(model.parameters(), lr=lr, momentum=sgd_momentum)
+        self.a_streams = torch.cuda.Stream() 
+        self.a_event = torch.cuda.Event()
+        self.g_streams = torch.cuda.Stream()
+        self.g_event = torch.cuda.Event()
         # self.model = model 
           
     ### Register hooks
@@ -103,15 +107,32 @@ class KFAC(optim.Optimizer):
                     self.m_a[module] = [new_fp32[-1], new_fp8]
                 else:
                     # weights
-                    # start = time.time()
-                    self.tasks.append(self.cpu_executor.submit(
-                        self._cpu_quantization_taskA, 
-                        module, new_fp32[:-1]
-                    ))
+                    with torch.cuda.stream(self.a_streams):
+                        # gpu -> cpu                
+                        quant_state_a_absmax_cpu = self.quant_state_a[module].absmax.to("cpu", non_blocking=True)
+                        new_fp32_cpu = new_fp32.to("cpu", non_blocking=True)
+                        m_a_1_cpu = self.m_a[module][1].to("cpu", non_blocking=True)
+                        m_a_0_cpu = self.m_a[module][0].to("cpu", non_blocking=True)
+                        self.a_event.record() 
+                                        
+                    # dequantize
+                    torch.cuda.current_stream().wait_event(self.a_event)
+                    m_a_old = B_F.dequantize_blockwise(A=m_a_1_cpu, absmax=quant_state_a_absmax_cpu, blocksize=self.block_size, code=self.code)
                     
-                    # bias
-                    torch.lerp(self.m_a[module][0], new_fp32[-1], self.factor_decay, out=self.m_a[module][0])
-                    # print(time.time()-start)
+                    # compute
+                    torch.lerp(m_a_0_cpu, new_fp32_cpu[-1], self.factor_decay, out=m_a_0_cpu)
+                    new_fp32_cpu = new_fp32_cpu[:-1]
+                    torch.lerp(m_a_old, new_fp32_cpu, self.factor_decay, out=new_fp32_cpu)
+                    
+                    # quantize
+                    new_fp8_cpu, quant_state_a_cpu = B_F.quantize_blockwise(new_fp32_cpu, code=self.code, blocksize=self.block_size)
+                        
+                    # cpu -> gpu
+                    with torch.cuda.stream(self.a_streams):
+                        self.quant_state_a[module].absmax = quant_state_a_cpu.absmax.to(self.device, non_blocking=True)
+                        self.m_a[module][0] = m_a_0_cpu.to(self.device, non_blocking=True)
+                        self.m_a[module][1] = new_fp8_cpu.to(self.device, non_blocking=True)
+                        
                             
     def _backward_hook_event(self, module, grad_input, grad_output):
         """Default: hook for saving gradient w.r.t output (g)"""
@@ -123,53 +144,32 @@ class KFAC(optim.Optimizer):
                     new_fp8, self.quant_state_g[module] = B_F.quantize_blockwise(new_fp32[1:], code=self.code, blocksize=self.block_size)
                     self.m_g[module] = [new_fp32[0], new_fp8]
                 else:
-                    # weights
-                    self.tasks.append(self.cpu_executor.submit(
-                            self._cpu_quantization_taskG, 
-                            module, new_fp32[1:]
-                    ))
-                    # bias
-                    torch.lerp(self.m_g[module][0], new_fp32[0], self.factor_decay, out=self.m_g[module][0])
-    
-    def _cpu_quantization_taskA(self, module, new_fp32):
-        # gpu -> cpu
-        self.quant_state_a[module].absmax = self.quant_state_a[module].absmax.cpu()
-        new_fp32 = new_fp32.cpu()
-        
-        # dequantize
-        m_a_old = B_F.dequantize_blockwise(self.m_a[module][1].cpu(), self.quant_state_a[module], blocksize=self.block_size)
-        
-        # compute
-        torch.lerp(m_a_old, new_fp32, self.factor_decay, out=new_fp32)
-        
-        # quantize
-        new_fp8, self.quant_state_a[module] = B_F.quantize_blockwise(new_fp32, code=self.code, blocksize=self.block_size)
-        
-        # gpu -> cpu
-        self.quant_state_a[module].absmax = self.quant_state_a[module].absmax.to(self.device, non_blocking=True)
-        self.quant_state_a[module].code = self.code
-        self.m_a[module][1] = new_fp8.to(self.device, non_blocking=True)
-            
-    def _cpu_quantization_taskG(self, module, new_fp32):
-        # gpu -> cpu
-        self.quant_state_g[module].absmax = self.quant_state_g[module].absmax.cpu()
-        new_fp32 = new_fp32.cpu()
-        
-        # dequantize
-        m_g_old = B_F.dequantize_blockwise(self.m_g[module][1].cpu(), self.quant_state_g[module], blocksize=self.block_size)
-
-        # compute
-        torch.lerp(m_g_old, new_fp32, self.factor_decay, out=new_fp32)
-
-        # quantize
-        new_fp8, self.quant_state_g[module] = B_F.quantize_blockwise(new_fp32, code=self.code, blocksize=self.block_size)
-
-        # gpu -> cpu
-        self.quant_state_g[module].absmax = self.quant_state_g[module].absmax.to(self.device, non_blocking=True)
-        self.quant_state_g[module].code = self.code
-        self.m_g[module][1] = new_fp8.to(self.device, non_blocking=True)
-
-    
+                    # gpu -> cpu
+                    with torch.cuda.stream(self.g_streams):
+                        quant_state_g_absmax_cpu = self.quant_state_g[module].absmax.to("cpu", non_blocking=True)
+                        new_fp32_cpu = new_fp32.to("cpu", non_blocking=True)
+                        m_g_1_cpu = self.m_g[module][1].to("cpu", non_blocking=True)
+                        m_g_0_cpu = self.m_g[module][0].to("cpu", non_blocking=True)
+                        self.g_event.record() 
+                    
+                    # dequantize
+                    torch.cuda.current_stream().wait_event(self.g_event)
+                    m_g_old = B_F.dequantize_blockwise(A=m_g_1_cpu, absmax=quant_state_g_absmax_cpu, blocksize=self.block_size, code=self.code)
+                    
+                    # compute
+                    torch.lerp(m_g_0_cpu, new_fp32_cpu[0], self.factor_decay, out=m_g_0_cpu)
+                    new_fp32_cpu = new_fp32_cpu[1:]
+                    torch.lerp(m_g_old, new_fp32_cpu, self.factor_decay, out=new_fp32_cpu)
+                    
+                    # quantize
+                    new_fp8_cpu, quant_state_g_cpu = B_F.quantize_blockwise(new_fp32_cpu, code=self.code, blocksize=self.block_size)
+                        
+                    # cpu -> gpu
+                    with torch.cuda.stream(self.g_streams):
+                        self.quant_state_g[module].absmax = quant_state_g_cpu.absmax.to(self.device, non_blocking=True)
+                        self.m_g[module][0] = m_g_0_cpu.to(self.device, non_blocking=True)
+                        self.m_g[module][1] = new_fp8_cpu.to(self.device, non_blocking=True)
+         
     def _register_module_hooks(self, model):
         """Register forard/backward hooks to supported modules"""
         supported_modules = {'Linear', 'Conv2d'}
@@ -196,15 +196,15 @@ class KFAC(optim.Optimizer):
         v_sum = 0
         vg_sum = 0
         
-        wait(self.tasks)
-        self.tasks.clear()
+        # wait(self.tasks)
+        # self.tasks.clear()
 
         for module in self.modules:
             ma = torch.cat((B_F.dequantize_blockwise(self.m_a[module][1], self.quant_state_a[module], blocksize=self.block_size), self.m_a[module][0].unsqueeze(0)), dim=0).view(-1, 1)
             mg = torch.cat((self.m_g[module][0].unsqueeze(0), B_F.dequantize_blockwise(self.m_g[module][1], self.quant_state_g[module], blocksize=self.block_size)), dim=0).view(-1, 1)
 
-            # print(ma)
-            # print(mg)
+            # print("ma:",ma)
+            # print("mg:",mg)
             grad = self._get_grad(module)
             
             # compute intermediate states
